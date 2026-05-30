@@ -1,0 +1,18 @@
+# arXiv Digest — runtime files (generated on each run, not for version control)
+reports/
+seen.json
+papers.json
+taxonomy_embeddings.json
+feed_debug.xml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
