@@ -1,0 +1,260 @@
+{
+  "Eclipsing Binaries": {
+    "desc": "Stars whose orbital plane is aligned so components transit each other, enabling precise masses, radii, and light-curve modelling.",
+    "subtopics": {
+      "Detached & semi-detached EBs": {
+        "desc": "Well-separated components, Roche-lobe geometry, precise absolute parameters.",
+        "keywords": [
+          "detached binar",
+          "semi-detached",
+          "eclipsing binar",
+          "eclipsing system",
+          "absolute parameter",
+          "mass ratio",
+          "roche lobe",
+          "light curve solution",
+          "radial velocit",
+          "double-lined",
+          "spectroscopic binar"
+        ]
+      },
+      "Contact & overcontact EBs": {
+        "desc": "W UMa-type systems sharing a common envelope.",
+        "keywords": [
+          "contact binar",
+          "overcontact",
+          "w uma",
+          "w ursae majoris",
+          "common envelope",
+          "fill factor",
+          "shallow contact"
+        ]
+      },
+      "Pulsating stars in EBs": {
+        "desc": "EBs hosting intrinsic pulsators: delta Sct, gamma Dor, RR Lyr, Cepheid, sdBV, roAp inside eclipsing or SB2 systems.",
+        "keywords": [
+          "pulsating",
+          "pulsation",
+          "oscillat",
+          "delta scuti",
+          "delta sct",
+          "gamma dor",
+          "gamma doradus",
+          "rr lyr",
+          "cepheid",
+          "sdbv",
+          "roap",
+          "tidally excited",
+          "tidal pulsation",
+          "heartbeat star",
+          "resonance locking",
+          "p-mode",
+          "g-mode",
+          "mixed mode",
+          "eclipsing binar",
+          "binary pulsator"
+        ]
+      },
+      "Heartbeat & tidally distorted EBs": {
+        "desc": "Eccentric binaries with tidal distortion near periastron; tidally excited oscillations.",
+        "keywords": [
+          "heartbeat",
+          "tidally distort",
+          "tidal distortion",
+          "eccentric binar",
+          "periastron",
+          "tidal excitation",
+          "tidal oscillat",
+          "ellipsoidal"
+        ]
+      },
+      "EB light-curve & radial-velocity modelling": {
+        "desc": "Codes and methods: PHOEBE, ELC, JKTEBOP, WD, etc.",
+        "keywords": [
+          "phoebe",
+          "jktebop",
+          "elc code",
+          "wd code",
+          "wilson-devinney",
+          "light curve model",
+          "lc modelling",
+          "rv curve",
+          "synthetic light curve",
+          "light curve fitting",
+          "binary modelling",
+          "eclipsing model"
+        ]
+      },
+      "ML & statistical classification of EBs": {
+        "desc": "Machine learning, neural networks, random forests used to identify or classify EBs in survey data.",
+        "keywords": [
+          "machine learning",
+          "neural network",
+          "random forest",
+          "deep learning",
+          "convolutional network",
+          "cnn",
+          "gradient boost",
+          "xgboost",
+          "eclipsing binary classif",
+          "binary classif",
+          "photometric classif",
+          "supervised learning",
+          "unsupervised",
+          "clustering",
+          "variability classif"
+        ]
+      },
+      "EB catalogue & survey studies": {
+        "desc": "Large-scale EB catalogues from Kepler, TESS, OGLE, Gaia, etc.",
+        "keywords": [
+          "kepler eb",
+          "tess eb",
+          "ogle eb",
+          "gaia eb",
+          "catalogue",
+          "catalog",
+          "survey",
+          "photometric survey",
+          "all-sky",
+          "eclipsing binar",
+          "period catalog",
+          "eb list"
+        ]
+      },
+      "Third bodies & multiple systems": {
+        "desc": "Tertiary companions found via eclipse timing variations (ETVs) or spectroscopy; hierarchical triples.",
+        "keywords": [
+          "third body",
+          "tertiary",
+          "eclipse timing",
+          "etv",
+          "o-c diagram",
+          "timing variation",
+          "hierarchical triple",
+          "quadruple",
+          "outer orbit",
+          "light travel time"
+        ]
+      },
+      "Mass transfer & evolution in EBs": {
+        "desc": "Algol-type systems, mass transfer, circularisation, apsidal motion.",
+        "keywords": [
+          "mass transfer",
+          "algol",
+          "apsidal motion",
+          "apsidal precession",
+          "circularisation",
+          "circularization",
+          "spin-orbit",
+          "tidal synchron",
+          "evolutionary track",
+          "isochrone",
+          "binary evolution"
+        ]
+      }
+    }
+  },
+  "Asteroseismology": {
+    "desc": "Probing stellar interiors through oscillation frequencies.",
+    "subtopics": {
+      "Solar-like oscillations & red giants": {
+        "desc": "Stochastically excited p-modes and mixed modes in solar-type stars and red giants; nu_max, Delta_nu scaling.",
+        "keywords": [
+          "solar-like oscillat",
+          "red giant",
+          "subgiant",
+          "delta nu",
+          "large separation",
+          "nu max",
+          "mixed mode",
+          "dipole mode",
+          "asymptotic relation",
+          "stochastic excitation",
+          "kepler asteroseismol",
+          "tess asteroseismol"
+        ]
+      },
+      "Classical pulsators": {
+        "desc": "Instability-strip pulsators: delta Sct, gamma Dor, RR Lyr, Cepheids, roAp, SdB/SdO pulsators.",
+        "keywords": [
+          "delta scuti",
+          "delta sct",
+          "gamma dor",
+          "gamma doradus",
+          "rr lyrae",
+          "cepheid",
+          "roap",
+          "rapidly oscillating ap",
+          "sdb pulsator",
+          "v361 hya",
+          "v1093 her",
+          "instability strip"
+        ]
+      },
+      "Frequency analysis & mode identification": {
+        "desc": "Period spacing, period-luminosity, echelle diagrams, prewhitening, mode identification.",
+        "keywords": [
+          "frequency analysis",
+          "period spacing",
+          "echelle diagram",
+          "prewhitening",
+          "iterative prewhitening",
+          "mode identification",
+          "period-luminosity",
+          "p-l relation",
+          "fourier analysis",
+          "combination frequency",
+          "harmonic"
+        ]
+      },
+      "Rotation & angular momentum in asteroseismology": {
+        "desc": "Internal rotation profiles, angular momentum transport, magnetic fields inferred from splittings.",
+        "keywords": [
+          "rotation profile",
+          "internal rotation",
+          "angular momentum",
+          "rotational splitting",
+          "core rotation",
+          "envelope rotation",
+          "magnetic field asteroseismol",
+          "differential rotation"
+        ]
+      },
+      "Stellar structure & modelling": {
+        "desc": "Grid modelling, stellar evolution codes, convective overshoot, opacity, equation of state.",
+        "keywords": [
+          "stellar model",
+          "stellar structure",
+          "evolutionary model",
+          "convective overshoot",
+          "convective penetration",
+          "opacity",
+          "equation of state",
+          "mesa",
+          "cestam",
+          "garstec",
+          "astec",
+          "seismic constraint",
+          "model grid"
+        ]
+      },
+      "Space photometry & instrumentation": {
+        "desc": "Kepler, K2, TESS, PLATO pipelines and data products for asteroseismology.",
+        "keywords": [
+          "kepler photometr",
+          "k2 photometr",
+          "tess photometr",
+          "plato",
+          "long cadence",
+          "short cadence",
+          "two-minute cadence",
+          "twenty-second",
+          "pixel file",
+          "lightkurve",
+          "background correction"
+        ]
+      }
+    }
+  }
+}
