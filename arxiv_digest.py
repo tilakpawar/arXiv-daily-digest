@@ -51,7 +51,7 @@ OLLAMA_MODEL  = "qwen2.5:14b"
 OLLAMA_URL    = "http://localhost:11434"
 
 CATEGORIES    = ["astro-ph.SR"]
-MAX_FETCH     = 120
+MAX_FETCH     = 25
 LOOKBACK_DAYS = 3
 
 # How many recent classified papers to show Qwen as few-shot triage examples
@@ -68,16 +68,20 @@ METHODS_CHARS     = 3000
 ABSTRACT_CHARS    = 2500
 NUM_CTX           = 8192
 
-ARXIV_API   = "https://export.arxiv.org/api/query"
-USER_AGENT  = "arxiv-digest/1.0 (local research tool)"
+# OAI-PMH endpoint — the official bulk-harvesting interface.
+# Unlike the REST API (export.arxiv.org/api/query) this endpoint has no
+# per-request rate limits and is designed for exactly this kind of daily
+# incremental harvest.  See https://info.arxiv.org/help/oa/index.html
+OAI_PMH_URL = "https://oaipmh.arxiv.org/oai"
+USER_AGENT  = "arxiv-digest/1.0 (mailto:tpawar@villanova.edu)"
 HTTP_TIMEOUT = (10, 90)
 
-ARXIV_MIN_DELAY    = 3.0
+# Polite delay between OAI-PMH requests (resumption-token pages).
+# The endpoint has no hard rate limit but a small sleep is courteous.
+OAI_PAGE_DELAY = 1.0
 # Shared state so concurrent fetch_fulltext threads queue politely
 _ARXIV_FETCH_LOCK = threading.Lock()
 _ARXIV_LAST_REQ   = [0.0]  # mutable singleton
-ARXIV_RATE_RETRIES = 5
-ARXIV_RATE_BACKOFF = 2.0
 
 HERE          = Path(__file__).resolve().parent
 REPORT_DIR    = HERE / "reports"
@@ -369,99 +373,278 @@ def few_shot_examples(db, subtopic_names, n=TRIAGE_EXAMPLES):
 
 
 # ---------------------------------------------------------------------------
-# 1. FETCH
+# 1. FETCH  (via OAI-PMH — the official arXiv bulk-harvesting interface)
 # ---------------------------------------------------------------------------
-def fetch_feed(lookback_days, save_feed=False):
-    import feedparser
+# Why OAI-PMH instead of the Atom/REST API?
+#   • No rate limits on incremental harvests — designed for exactly this use.
+#   • Resumption tokens let us page through large result sets cleanly.
+#   • The `from` parameter gives precise date-based filtering.
+#   • Base URL: https://oaipmh.arxiv.org/oai  (updated March 2025)
+#   • Docs:     https://info.arxiv.org/help/oa/index.html
+#
+# OAI-PMH sets for astro-ph sub-categories use the pattern:
+#   physics:astro-ph.SR   (group:archive.SUBCATEGORY)
+# All astro-ph: physics:astro-ph   — full astro-ph archive
+# ---------------------------------------------------------------------------
 
-    cat_query = " OR ".join(f"cat:{c}" for c in CATEGORIES)
-    params = {
-        "search_query": cat_query,
-        "sortBy":       "submittedDate",
-        "sortOrder":    "descending",
-        "start":        0,
-        "max_results":  MAX_FETCH,
+def _oai_set_for_category(cat):
+    """
+    Map an arXiv category string to its OAI-PMH set spec.
+
+    The OAI-PMH set hierarchy is group:archive:SUBCATEGORY where SUBCATEGORY
+    is only the suffix code (uppercase), not the full dotted name.  Confirmed
+    against https://oaipmh.arxiv.org/oai?verb=ListSets
+
+    Examples:
+        "astro-ph.SR"  -> "physics:astro-ph:SR"
+        "astro-ph"     -> "physics:astro-ph"
+        "cs.AI"        -> "cs:cs:AI"
+        "math.NT"      -> "math:math:NT"
+        "physics.optics" -> "physics:physics:optics"
+    """
+    parts = cat.split(".")
+    archive = parts[0]          # e.g. "astro-ph", "cs", "math"
+    # Determine group from well-known archives
+    _GROUP = {
+        "astro-ph": "physics", "cond-mat": "physics", "gr-qc": "physics",
+        "hep-ex": "physics", "hep-lat": "physics", "hep-ph": "physics",
+        "hep-th": "physics", "math-ph": "physics", "nlin": "physics",
+        "nucl-ex": "physics", "nucl-th": "physics", "physics": "physics",
+        "quant-ph": "physics",
+        "cs": "cs", "econ": "econ", "eess": "eess", "math": "math",
+        "q-bio": "q-bio", "q-fin": "q-fin", "stat": "stat",
     }
-    url = ARXIV_API + "?" + requests.compat.urlencode(params)
-    log.info("STAGE 1 fetch — querying arXiv (%s, max %d)", cat_query, MAX_FETCH)
-    log.debug("GET %s", url)
+    group = _GROUP.get(archive, archive)
+    if len(parts) == 1:
+        return f"{group}:{archive}"
+    # Subcategory is the suffix only (e.g. "SR" from "astro-ph.SR")
+    subcategory = parts[1]
+    return f"{group}:{archive}:{subcategory}"
 
-    wait = 60.0
-    resp = None
-    for attempt in range(1, ARXIV_RATE_RETRIES + 2):
-        try:
-            resp = SESSION.get(url, timeout=HTTP_TIMEOUT)
-            log.debug("HTTP %s, %d bytes", resp.status_code, len(resp.text))
-        except requests.RequestException as e:
-            log.error("arXiv request failed: %s", e)
-            return []
 
-        rate_limited = (resp.status_code == 429
-                        or "rate exceeded" in resp.text[:200].lower())
-        if rate_limited:
-            if attempt > ARXIV_RATE_RETRIES:
-                log.error("arXiv rate-limit persists after %d retries — giving up.", ARXIV_RATE_RETRIES)
-                return []
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    wait = max(wait, float(retry_after) + 5)
-                except ValueError:
-                    pass
-            log.warning("arXiv rate-limit (HTTP %s, attempt %d/%d) — waiting %.0f s …",
-                        resp.status_code, attempt, ARXIV_RATE_RETRIES, wait)
-            time.sleep(wait)
-            wait *= ARXIV_RATE_BACKOFF
+def _oai_parse_records(xml_text):
+    """
+    Parse OAI-PMH ListRecords XML and return a list of raw record dicts.
+    Uses the arXiv native metadata format (metadataPrefix=arXiv).
+    """
+    import xml.etree.ElementTree as ET
+
+    NS = {
+        "oai":   "http://www.openarchives.org/OAI/2.0/",
+        "arxiv": "http://arxiv.org/OAI/arXiv/",
+    }
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        log.error("OAI-PMH XML parse error: %s", exc)
+        return [], None
+
+    # Check for OAI errors (e.g. noRecordsMatch, badArgument)
+    error_el = root.find(".//oai:error", NS)
+    if error_el is not None:
+        code = error_el.get("code", "unknown")
+        msg  = (error_el.text or "").strip()
+        if code == "noRecordsMatch":
+            log.info("  OAI-PMH: noRecordsMatch (no new papers in date range)")
+        else:
+            log.error("  OAI-PMH error [%s]: %s", code, msg)
+        return [], None
+
+    # Extract resumption token (None = last page)
+    token_el = root.find(".//oai:resumptionToken", NS)
+    resumption_token = (token_el.text or "").strip() if token_el is not None else None
+    if not resumption_token:
+        resumption_token = None
+
+    records = []
+    for rec in root.findall(".//oai:record", NS):
+        # Skip deleted records
+        header = rec.find("oai:header", NS)
+        if header is not None and header.get("status") == "deleted":
             continue
 
-        if resp.status_code != 200:
-            log.error("Unexpected HTTP %s from arXiv — aborting.", resp.status_code)
-            return []
+        meta = rec.find(".//arxiv:arXiv", NS)
+        if meta is None:
+            continue
 
-        time.sleep(ARXIV_MIN_DELAY)
-        break
+        def _text(tag):
+            el = meta.find(f"arxiv:{tag}", NS)
+            return (el.text or "").strip() if el is not None else ""
 
-    if save_feed:
-        (HERE / "feed_debug.xml").write_text(resp.text)
-        log.info("raw feed saved to feed_debug.xml")
+        arxiv_id = _text("id")           # e.g. "2501.12345"
+        title    = re.sub(r"\s+", " ", _text("title").replace("\n", " ")).strip()
+        abstract = re.sub(r"\s+", " ", _text("abstract").replace("\n", " ")).strip()
 
-    feed = feedparser.parse(resp.text)
-    if feed.bozo:
-        log.warning("feedparser flagged the response: %s", feed.bozo_exception)
-    log.info("  feed returned %d entries (before date filter)", len(feed.entries))
-    if not feed.entries:
-        log.error("  arXiv returned NO entries — try --save-feed and inspect feed_debug.xml.")
+        # Authors
+        authors = []
+        for author_el in meta.findall("arxiv:authors/arxiv:author", NS):
+            forenames = (author_el.findtext("arxiv:forenames", "", NS) or "").strip()
+            keyname   = (author_el.findtext("arxiv:keyname",   "", NS) or "").strip()
+            name = f"{forenames} {keyname}".strip() if forenames else keyname
+            if name:
+                authors.append(name)
+
+        # Categories (primary first, then cross-listed)
+        primary_cat = _text("categories").split()[0] if _text("categories") else ""
+        categories  = _text("categories").split()
+
+        # Submission date — use the datestamp from the OAI header as proxy.
+        # arXiv's created/updated fields are also in the arXiv namespace.
+        created_str = _text("created")   # "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+        if created_str:
+            date_part = created_str[:10]
+        else:
+            # Fall back to header datestamp
+            ds = header.findtext("oai:datestamp", "", NS) if header is not None else ""
+            date_part = ds[:10] if ds else ""
+
+        if not arxiv_id or not title:
+            continue
+
+        base_id = re.sub(r"v\d+$", "", arxiv_id)
+        records.append({
+            "arxiv_id":  arxiv_id,
+            "base_id":   base_id,
+            "title":     title,
+            "abstract":  abstract,
+            "authors":   authors,
+            "date_str":  date_part,         # "YYYY-MM-DD"
+            "categories": categories,
+            "primary":   primary_cat,
+        })
+
+    return records, resumption_token
+
+
+def fetch_feed(lookback_days, save_feed=False):
+    """
+    Harvest recent papers from arXiv using OAI-PMH (no rate limits).
+
+    Strategy:
+      • Build a `from` date = today − lookback_days.
+      • Request one set per CATEGORIES entry (or all in one go if they share
+        the same archive — the typical case for astro-ph.SR).
+      • Follow resumption tokens to page through results.
+      • Filter to papers whose creation date falls inside the window.
+    """
+    import xml.etree.ElementTree as ET
+
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    from_str = cutoff.strftime("%Y-%m-%d")
+
+    # Build the set list — one OAI set per requested category.
+    # If multiple categories share one archive (e.g. astro-ph.SR + astro-ph.GA)
+    # we could harvest the parent set once; for simplicity we harvest each set.
+    sets = [_oai_set_for_category(cat) for cat in CATEGORIES]
+    log.info("STAGE 1 fetch — OAI-PMH harvest | sets=%s | from=%s | max=%d",
+             sets, from_str, MAX_FETCH)
+
+    all_raw   = []    # raw record dicts from XML
+    seen_ids  = set() # dedup across sets
+
+    for oai_set in sets:
+        params = {
+            "verb":            "ListRecords",
+            "metadataPrefix":  "arXiv",
+            "set":             oai_set,
+            "from":            from_str,
+        }
+        page = 0
+        while True:
+            url = OAI_PMH_URL + "?" + requests.compat.urlencode(params)
+            log.debug("OAI-PMH GET %s", url)
+            try:
+                resp = SESSION.get(url, timeout=HTTP_TIMEOUT)
+            except requests.RequestException as exc:
+                log.error("OAI-PMH request failed: %s", exc)
+                break
+
+            if resp.status_code != 200:
+                log.error("OAI-PMH HTTP %s — aborting set %s", resp.status_code, oai_set)
+                break
+
+            if save_feed:
+                fname = HERE / f"feed_debug_p{page}.xml"
+                fname.write_text(resp.text, encoding="utf-8")
+                log.info("raw OAI page saved to %s", fname)
+
+            records, token = _oai_parse_records(resp.text)
+            log.debug("  page %d: %d records, token=%s", page, len(records),
+                      bool(token))
+
+            for r in records:
+                if r["base_id"] not in seen_ids:
+                    seen_ids.add(r["base_id"])
+                    all_raw.append(r)
+
+            # Stop if we already have enough or there are no more pages
+            if token is None or len(all_raw) >= MAX_FETCH:
+                break
+
+            # Follow resumption token
+            params = {"verb": "ListRecords", "resumptionToken": token}
+            page  += 1
+            time.sleep(OAI_PAGE_DELAY)
+
+    log.info("  OAI-PMH returned %d unique records (before date/category filter)",
+             len(all_raw))
+
+    if not all_raw:
+        log.error("  No records returned — check OAI sets or widen --days.")
         return []
 
-    newest = feed.entries[0]
-    np = datetime(*newest.published_parsed[:6], tzinfo=timezone.utc)
-    log.info("  newest paper submitted %s UTC", np.strftime("%Y-%m-%d %H:%M"))
+    # Convert to the paper dict format used by the rest of the pipeline.
+    # Filter: keep only papers whose primary category is in CATEGORIES and
+    # whose creation date falls within the lookback window.
+    cat_set = set(CATEGORIES)
+    papers, too_old, wrong_cat = [], 0, 0
+    for r in all_raw:
+        # Category filter (primary category must be requested)
+        if not any(c in cat_set for c in r["categories"]):
+            wrong_cat += 1
+            continue
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    papers, too_old = [], 0
-    for e in feed.entries:
-        published = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        if published < cutoff:
+        # Date filter
+        if r["date_str"]:
+            try:
+                pub_date = datetime.strptime(r["date_str"], "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc)
+            except ValueError:
+                pub_date = None
+        else:
+            pub_date = None
+
+        if pub_date and pub_date < cutoff:
             too_old += 1
             continue
-        arxiv_id = e.id.split("/abs/")[-1]
-        base_id  = re.sub(r"v\d+$", "", arxiv_id)
-        pdf_link = next((l.href for l in e.links
-                         if l.get("type") == "application/pdf"), None)
+
+        base_id = r["base_id"]
         papers.append({
-            "id": arxiv_id, "base_id": base_id,
-            "title":      " ".join(e.title.split()),
-            "abstract":   " ".join(e.summary.split()),
-            "authors":    [a.name for a in e.authors],
-            "published":  published.strftime("%Y-%m-%d"),
-            "categories": [t.term for t in e.tags],
-            "abs_url":    f"https://arxiv.org/abs/{base_id}",
-            "pdf_url":    pdf_link or f"https://arxiv.org/pdf/{base_id}",
+            "id":        r["arxiv_id"],
+            "base_id":   base_id,
+            "title":     r["title"],
+            "abstract":  r["abstract"],
+            "authors":   r["authors"],
+            "published": r["date_str"] or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "categories": r["categories"],
+            "abs_url":   f"https://arxiv.org/abs/{base_id}",
+            "pdf_url":   f"https://arxiv.org/pdf/{base_id}",
         })
-    log.info("  %d within last %d day(s); %d older dropped",
-             len(papers), lookback_days, too_old)
-    if not papers and too_old:
-        log.warning("  every paper older than window — try --days %d.", lookback_days + 4)
+
+        if len(papers) >= MAX_FETCH:
+            break
+
+    log.info("  %d papers kept (lookback=%dd); %d too old, %d wrong category",
+             len(papers), lookback_days, too_old, wrong_cat)
+
+    if papers:
+        log.info("  newest: %s  oldest: %s",
+                 max(p["published"] for p in papers),
+                 min(p["published"] for p in papers))
+    else:
+        log.warning("  No papers in window — try --days %d.", lookback_days + 4)
+
     return papers
 
 
@@ -774,12 +957,15 @@ def _extract_sections_from_html(html_text):
     return abstract, intro, methods, concl
 
 
+_FULLTEXT_MIN_DELAY = 3.0  # polite delay between HTML/PDF fulltext fetches
+
 def _arxiv_get(url, **kw):
-    # Rate-limited GET: enforces ARXIV_MIN_DELAY globally across threads.
-    # Concurrent callers queue here rather than each sleeping independently.
+    # Rate-limited GET: enforces _FULLTEXT_MIN_DELAY globally across threads
+    # for HTML/PDF fulltext fetches.  Concurrent callers queue here rather
+    # than each sleeping independently.
     with _ARXIV_FETCH_LOCK:
         elapsed = time.time() - _ARXIV_LAST_REQ[0]
-        gap = ARXIV_MIN_DELAY - elapsed
+        gap = _FULLTEXT_MIN_DELAY - elapsed
         if gap > 0:
             time.sleep(gap)
         r = SESSION.get(url, **kw)
@@ -1329,7 +1515,7 @@ def main():
     # Ollama is single-GPU so concurrent LLM calls don't help.
     # But fetch_fulltext is pure network I/O (~3-10s) and can run in a
     # background thread while Ollama summarises the previous paper (~10-25s).
-    # _arxiv_get enforces the 3s arXiv policy across all threads via a lock.
+    # _arxiv_get enforces a polite delay for HTML/PDF fulltext fetches across all threads via a lock.
     #
     # Timeline without pipeline:  [triage][fetch][summarise] [triage][fetch][summarise]
     # Timeline with pipeline:     [triage][fetch][summarise]

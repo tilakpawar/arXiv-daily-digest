@@ -26,9 +26,15 @@ the model only weighs in on the borderline cases. Same for the text — it reads
 abstract, intro, methods, and conclusions, not the whole PDF. So a daily run is
 quick even on a laptop.
 
+Paper metadata is fetched via arXiv's **OAI-PMH interface**
+(`https://oaipmh.arxiv.org/oai`) rather than the rate-limited REST/Atom API.
+OAI-PMH is the official bulk-harvesting endpoint — no rate limits, resumption-token
+paging, and precise `from`-date filtering. The only outbound traffic is arXiv and
+your local Ollama server.
+
 ```
-arXiv  →  keyword filter  →  embedding triage  →  (borderline only) LLM check
-       →  fetch text  →  LLM summary  →  HTML report
+arXiv (OAI-PMH)  →  keyword filter  →  embedding triage  →  (borderline only) LLM check
+                 →  fetch text  →  LLM summary  →  HTML report
 ```
 
 ## Quick start
@@ -50,6 +56,10 @@ python3 arxiv_digest.py
 
 First run writes a starter topic list, builds its embeddings, and opens the report.
 Reports pile up in `./reports/`, with `index.html` listing them all.
+
+> **Dependencies:** only `requests` and `beautifulsoup4` are required.
+> OAI-PMH XML parsing uses Python's built-in `xml.etree.ElementTree` — no
+> `feedparser` needed.
 
 ## Picking your topics
 
@@ -96,10 +106,14 @@ the categories, and the lookback window).
 
 ## Good to know
 
-- It respects arXiv's rate limits, so a big first run takes a little patience.
+- Papers are fetched via OAI-PMH, arXiv's official bulk-harvesting interface.
+  There are no per-request rate limits; the tool uses a short polite delay between
+  resumption-token pages only.
+- `--save-feed` dumps each OAI-PMH page as `feed_debug_p0.xml`, `feed_debug_p1.xml`, …
 - PDF reading is optional — uncomment `PyMuPDF` in `requirements.txt` to enable the
   fallback for papers without an HTML version.
-- Everything is local; the only thing it talks to is arXiv.
+- Everything is local; the only external host it contacts is `oaipmh.arxiv.org`
+  (metadata) and `arxiv.org` (HTML/PDF fulltext).
 
 ## License
 

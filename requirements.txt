@@ -1,5 +1,6 @@
 requests>=2.28
-feedparser>=6.0
 beautifulsoup4>=4.11
+# xml.etree.ElementTree (OAI-PMH parsing) is part of the Python standard library.
+# feedparser is no longer needed — arXiv feed fetching now uses OAI-PMH directly.
 # Optional Tier-3 PDF fallback (only used when no HTML version exists):
 # PyMuPDF>=1.23
