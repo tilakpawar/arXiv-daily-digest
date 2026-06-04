@@ -47,11 +47,11 @@ from concurrent.futures import ThreadPoolExecutor
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-OLLAMA_MODEL  = "qwen2.5:14b"
+OLLAMA_MODEL  = "qwen2.5:7b"
 OLLAMA_URL    = "http://localhost:11434"
 
 CATEGORIES    = ["astro-ph.SR"]
-MAX_FETCH     = 25
+MAX_FETCH     = 300
 LOOKBACK_DAYS = 3
 
 # How many recent classified papers to show Qwen as few-shot triage examples
@@ -104,8 +104,8 @@ EMBED_BACKGROUND = (
 )
 
 # Embedding model — must be pulled in Ollama: `ollama pull nomic-embed-text`
-# It is tiny (~274 MB) and ~100x faster than qwen2.5:14b for embeddings.
-# Falls back to qwen2.5:14b if not available.
+# It is tiny (~274 MB) and ~100x faster than qwen2.5:7b for embeddings.
+# Falls back to qwen2.5:7b if not available.
 EMBED_MODEL   = "nomic-embed-text"
 
 # Thresholds applied to the *lift* score (subtopic similarity MINUS background
@@ -118,8 +118,8 @@ EMBED_MODEL   = "nomic-embed-text"
 #   lift <  EMBED_REVIEW  → dropped (clear miss)
 #
 # Run --calibrate to see the lift distribution and get suggested values.
-EMBED_ACCEPT  = 0.03   # lift above background for confident accept
-EMBED_REVIEW  = 0.00   # lift above background for borderline review
+EMBED_ACCEPT  = -999   # lift above background for confident accept
+EMBED_REVIEW  = -999   # lift above background for borderline review
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -204,7 +204,7 @@ SEED_TAXONOMY = {
                 "keywords": [
                     "kepler eb", "tess eb", "ogle eb", "gaia eb", "catalogue",
                     "catalog", "survey", "photometric survey", "all-sky", "eclipsing binar",
-                    "period catalog", "eb list",
+                    "period catalog", "eb list", "tess", "transiting exoplanet survey satellite",
                 ]
             },
             "Third bodies & multiple systems": {
@@ -283,7 +283,7 @@ SEED_TAXONOMY = {
                 "keywords": [
                     "kepler photometr", "k2 photometr", "tess photometr", "plato",
                     "long cadence", "short cadence", "two-minute cadence",
-                    "twenty-second", "pixel file", "lightkurve", "background correction",
+                    "twenty-second", "pixel file", "lightkurve", "background correction", "tess", "tess sector", "tess light curve",
                 ]
             },
         }
@@ -324,6 +324,192 @@ def all_keywords(tax):
         for s in t.get("subtopics", {}).values():
             kws.update(s.get("keywords", []))
     return kws
+
+
+# ---------------------------------------------------------------------------
+# SEED TAXONOMY FROM AUTHOR  (--seed-author "Surname Forename")
+# ---------------------------------------------------------------------------
+def seed_from_author(author_name, tax, lookback_days=365):
+    """
+    Harvest recent astro-ph.SR papers via OAI-PMH (same bulk endpoint as
+    fetch_feed), filter client-side by author name, then ask Qwen to suggest
+    keyword/subtopic additions to the taxonomy based on those papers.
+
+    No extra API calls — reuses the existing SESSION + OAI-PMH pipeline.
+    """
+    log.info("SEED FROM AUTHOR — harvesting last %dd of astro-ph.SR …", lookback_days)
+
+    # Temporarily raise MAX_FETCH for this wide harvest
+    import xml.etree.ElementTree as ET
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    from_str = cutoff.strftime("%Y-%m-%d")
+    oai_set  = _oai_set_for_category("astro-ph.SR")
+
+    params   = {
+        "verb":           "ListRecords",
+        "metadataPrefix": "arXiv",
+        "set":            oai_set,
+        "from":           from_str,
+    }
+
+    # Normalise author name for fuzzy matching:
+    # "Pawar T" / "T Pawar" / "Pawar, T" all reduce to a comparable set of tokens
+    name_tokens = set(re.split(r"[\s,\.]+", author_name.lower())) - {""}
+
+    all_raw  = []
+    page     = 0
+    MAX_AUTHOR_FETCH = 2000   # pages through up to 2000 records bulk
+
+    log.info("  OAI-PMH bulk harvest | set=%s | from=%s | cap=%d",
+             oai_set, from_str, MAX_AUTHOR_FETCH)
+
+    while len(all_raw) < MAX_AUTHOR_FETCH:
+        url = OAI_PMH_URL + "?" + requests.compat.urlencode(params)
+        log.debug("  OAI page %d — GET %s", page, url)
+        try:
+            resp = SESSION.get(url, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log.error("OAI-PMH request failed: %s", e)
+            break
+
+        records, token = _oai_parse_records(resp.text)
+        log.debug("  page %d: %d records", page, len(records))
+        all_raw.extend(records)
+
+        if not token:
+            break
+        params = {"verb": "ListRecords", "resumptionToken": token}
+        page  += 1
+        time.sleep(OAI_PAGE_DELAY)
+
+    log.info("  %d total records harvested — filtering by author %r …",
+             len(all_raw), author_name)
+
+    # Client-side author filter: any name token overlap is a candidate hit.
+    # e.g. name_tokens={"pawar","t"} matches author "T Pawar" or "Pawar Tushar"
+    matched = []
+    for r in all_raw:
+        for a in r.get("authors", []):
+            a_tokens = set(re.split(r"[\s,\.]+", a.lower())) - {""}
+            if name_tokens & a_tokens:   # non-empty intersection
+                matched.append(r)
+                break
+
+    log.info("  %d papers matched author %r", len(matched), author_name)
+    if not matched:
+        log.warning("No papers found for author %r — check spelling or widen --days.",
+                    author_name)
+        return tax
+
+    # Convert to the same paper dict shape the rest of the pipeline uses
+    papers = []
+    for r in matched:
+        base_id = r["base_id"]
+        papers.append({
+            "base_id":   base_id,
+            "title":     r["title"],
+            "abstract":  r["abstract"],
+            "authors":   r["authors"],
+            "published": r["date_str"],
+            "abs_url":   f"https://arxiv.org/abs/{base_id}",
+        })
+
+    # Show what we found before passing to Qwen
+    log.info("  Papers found:")
+    for p in papers:
+        log.info("    [%s] %s", p["published"], p["title"][:70])
+
+    if not check_ollama():
+        log.error("Ollama unreachable — cannot seed taxonomy without LLM.")
+        return tax
+
+    # Build taxonomy summary and paper block for Qwen — same pattern as
+    # expand_taxonomy()
+    tax_summary = []
+    for tname, t in tax.items():
+        tax_summary.append(f"Topic: {tname}")
+        for sname, s in t.get("subtopics", {}).items():
+            kws = ", ".join(s.get("keywords", [])[:10])
+            tax_summary.append(f"  Sub-topic: {sname}  [keywords: {kws}]")
+    tax_str = "\n".join(tax_summary)
+
+    paper_block = "\n\n".join(
+        f"Title: {p['title']}\nAbstract: {p['abstract'][:600]}"
+        for p in papers[:40]   # cap at 40 to stay within context
+    )
+
+    prompt = (
+        "You are an expert in stellar astrophysics, eclipsing binaries, and asteroseismology.\n\n"
+        "A researcher's own papers are listed below. Your job is to extract keywords and "
+        "phrases from their titles and abstracts that would help a daily arXiv digest "
+        "find papers similar to their work.\n\n"
+        "Current taxonomy:\n"
+        f"{tax_str}\n\n"
+        "Researcher's papers:\n\n"
+        f"{paper_block}\n\n"
+        "Respond with JSON only — suggest keyword additions to existing sub-topics, "
+        "and new sub-topics if the researcher works on something not yet covered:\n"
+        "{\n"
+        '  "keyword_additions": [\n'
+        '    {"subtopic": "<existing sub-topic name>", "keywords": ["kw1", "kw2", ...]},\n'
+        '    ...\n'
+        '  ],\n'
+        '  "new_subtopics": [\n'
+        '    {"parent_topic": "<existing topic name>", "name": "<sub-topic name>",\n'
+        '     "desc": "<one sentence>", "keywords": ["kw1", ...]},\n'
+        '    ...\n'
+        '  ]\n'
+        '}'
+    )
+
+    try:
+        raw      = ollama(prompt, json_mode=True, num_predict=1500)
+        proposals = json.loads(raw)
+    except Exception as e:
+        log.error("Qwen author-seed failed: %s", e)
+        return tax
+
+    # Merge proposals — identical logic to expand_taxonomy()
+    new_tax        = copy.deepcopy(tax)
+    n_new_subtopics = 0
+    n_new_keywords  = 0
+
+    for ka in proposals.get("keyword_additions", []):
+        subtopic = ka.get("subtopic", "").strip()
+        new_kws  = [k.lower() for k in ka.get("keywords", [])]
+        for tname, t in new_tax.items():
+            if subtopic in t.get("subtopics", {}):
+                existing = set(t["subtopics"][subtopic].get("keywords", []))
+                added    = [k for k in new_kws if k not in existing]
+                t["subtopics"][subtopic].setdefault("keywords", []).extend(added)
+                if added:
+                    log.info("  + keywords for [%s]: %s", subtopic, added)
+                    n_new_keywords += len(added)
+                break
+
+    for ns in proposals.get("new_subtopics", []):
+        parent = ns.get("parent_topic", "").strip()
+        name   = ns.get("name", "").strip()
+        if not name or not parent:
+            continue
+        matched_parent = next(
+            (k for k in new_tax if k.lower() == parent.lower()), None)
+        if matched_parent is None:
+            log.debug("  author-seed: unknown parent %r — skipping", parent)
+            continue
+        if name not in new_tax[matched_parent]["subtopics"]:
+            new_tax[matched_parent]["subtopics"][name] = {
+                "desc":     ns.get("desc", ""),
+                "keywords": [k.lower() for k in ns.get("keywords", [])],
+                "source":   "author-seed",
+            }
+            log.info("  + new sub-topic [%s] > %s", matched_parent, name)
+            n_new_subtopics += 1
+
+    log.info("Author seed done — %d new keywords, %d new sub-topics from %d papers.",
+             n_new_keywords, n_new_subtopics, len(papers))
+    return new_tax
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1351,98 @@ def expand_taxonomy(tax, lookback_days=14):
     return new_tax
 
 
+def _render_keyword_appendix(all_papers, tax):
+    """
+    Build an HTML section listing every fetched paper whose title or abstract
+    contains at least one taxonomy keyword, grouped by the subtopics that matched.
+    Papers already fully summarised in the main cards are included too — they
+    appear here as a quick-reference index alongside the ones that were filtered
+    out by embedding/triage.
+    """
+    flat = all_subtopics(tax)
+
+    # For each paper collect which subtopics matched and which keywords triggered
+    rows = []   # (paper_dict, [(subtopic_name, [matched_kws]), ...])
+    for p in all_papers:
+        hay  = (p["title"] + " " + p["abstract"]).lower()
+        hits = {}   # subtopic_name -> list of matched keywords
+        for sname, s in flat.items():
+            matched_kws = [kw for kw in s.get("keywords", []) if kw in hay]
+            if matched_kws:
+                hits[sname] = matched_kws
+        if hits:
+            rows.append((p, hits))
+
+    if not rows:
+        return ""
+
+    # Group rows by their top-level parent topic
+    by_parent = {}
+    for p, hits in rows:
+        # A paper may span multiple parents; list it under each
+        parents = {flat[sname]["parent"] for sname in hits}
+        for parent in parents:
+            by_parent.setdefault(parent, []).append((p, hits))
+
+    sections = []
+    for parent, entries in by_parent.items():
+        # De-duplicate papers within this parent (same paper may hit multiple subtopics)
+        seen_ids = set()
+        li_items = []
+        for p, hits in entries:
+            if p["base_id"] in seen_ids:
+                continue
+            seen_ids.add(p["base_id"])
+
+            # Collect only the subtopics that belong to this parent
+            parent_hits = {
+                sname: kws for sname, kws in hits.items()
+                if flat[sname]["parent"] == parent
+            }
+            subtopic_badges = " ".join(
+                f"<span class='kw-sub'>{_esc(sname)}</span>"
+                for sname in parent_hits
+            )
+            # Show a sample of the triggering keywords (cap at 5 per paper)
+            all_kws = sorted({kw for kws in parent_hits.values() for kw in kws})
+            kw_str  = ", ".join(all_kws[:5]) + ("…" if len(all_kws) > 5 else "")
+
+            li_items.append(
+                f"<li class='kw-item'>"
+                f"<a href='https://arxiv.org/abs/{_esc(p['base_id'])}' target='_blank'>"
+                f"{_esc(p['title'])}</a> "
+                f"<span class='kw-date'>{_esc(p['published'])}</span> "
+                f"{subtopic_badges}"
+                f"<span class='kw-triggers'>{_esc(kw_str)}</span>"
+                f"</li>"
+            )
+
+        if li_items:
+            sections.append(
+                f"<div class='kw-group'>"
+                f"<h3 class='kw-heading'>{_esc(parent)}</h3>"
+                f"<ul class='kw-list'>{''.join(li_items)}</ul>"
+                f"</div>"
+            )
+
+    toggle_id = "kw-appendix-body"
+    return f"""
+<section class='kw-appendix' id='kw-appendix'>
+  <h2 class='kw-appendix-title'>
+    Keyword-matched papers
+    <button class='kw-toggle' onclick="
+      var b=document.getElementById('{toggle_id}');
+      var btn=this;
+      if(b.style.display==='none'){{b.style.display='block';btn.textContent='▲ collapse';}}
+      else{{b.style.display='none';btn.textContent='▼ expand';}}
+    ">▼ expand</button>
+    <span class='kw-count'>{len(rows)} paper(s)</span>
+  </h2>
+  <div id='{toggle_id}' style='display:none'>
+    {''.join(sections)}
+  </div>
+</section>"""
+
 # ---------------------------------------------------------------------------
 # 8. RENDER
 # ---------------------------------------------------------------------------
@@ -1208,8 +1486,12 @@ def render_report(date_str, items, tax):
 
     all_topics = ", ".join(tax.keys())
     body = "\n".join(cards) if cards else "<p class='empty'>No matching papers today.</p>"
+
+    # Keyword appendix — appended after the main cards
+    appendix = _render_keyword_appendix(all_papers, tax) if all_papers else ""
+
     page = REPORT_TEMPLATE.format(
-        date=date_str, count=len(items), body=body,
+        date=date_str, count=len(items), body=body + appendix,   # ← append here
         model=_esc(OLLAMA_MODEL), topics=_esc(all_topics))
     out = REPORT_DIR / f"{date_str}.html"
     out.write_text(page, encoding="utf-8")
@@ -1351,6 +1633,10 @@ def main():
                     help="restrict to topic(s) or sub-topic(s) by name. "
                          "A top-level topic expands to all its sub-topics. "
                          "Use --list-topics to see all names.")
+    ap.add_argument("--seed-author", metavar="NAME",
+                help="harvest this author's arXiv papers and seed the taxonomy "
+                     "with keywords from their work (use --days to set lookback, "
+                     "default 365)")
     ap.add_argument("--list-topics",      action="store_true",
                     help="print taxonomy and exit")
     ap.add_argument("--expand-taxonomy",  action="store_true",
@@ -1387,6 +1673,13 @@ def main():
         new_tax = expand_taxonomy(tax, lookback_days=args.days or 14)
         save_taxonomy(new_tax)
         log.info("taxonomy.json updated.")
+        return
+
+    if args.seed_author:
+        new_tax = seed_from_author(args.seed_author, tax,
+                                   lookback_days=args.days or 365)
+        save_taxonomy(new_tax)
+        log.info("taxonomy.json updated from author papers.")
         return
 
     # -- resolve --topics: accepts top-level topic names OR sub-topic names --
@@ -1434,7 +1727,7 @@ def main():
     # Stage 1: fetch
     papers = fetch_feed(args.days, save_feed=args.save_feed)
     if not papers:
-        render_report(datetime.now().strftime("%Y-%m-%d"), [], tax)
+        render_report(datetime.now().strftime("%Y-%m-%d"), [], tax, all_papers=papers)
         log.info("nothing to do.")
         return
 
@@ -1590,7 +1883,7 @@ def main():
              len(kept), n_rejected, len(paper_db))
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    out = render_report(date_str, kept, tax)
+    out = render_report(date_str, kept, tax, all_papers=papers)
     log.info("Report: %s", out)
     try:
         webbrowser.open(out.as_uri())
@@ -1635,6 +1928,27 @@ REPORT_TEMPLATE = """<!doctype html>
   .links {{ font-size:13px; margin:14px 0 0; }}
   .links a {{ color:#7cc4ff; text-decoration:none; margin-right:4px; }}
   .empty {{ color:#9aa0aa; text-align:center; padding:60px 0; }}
+  
+  .kw-appendix { border-top:2px solid #2a2e35; margin-top:48px; padding-top:24px; }
+  .kw-appendix-title { font-size:18px; font-weight:600; display:flex;
+    align-items:center; gap:12px; margin:0 0 20px; }
+  .kw-toggle { background:#1e2a3a; color:#85c8f0; border:1px solid #2a4a6a;
+    border-radius:8px; padding:3px 12px; cursor:pointer; font-size:13px; }
+  .kw-toggle:hover { background:#2a3a4a; }
+  .kw-count { color:#9aa0aa; font-size:14px; font-weight:400; }
+  .kw-group { margin-bottom:28px; }
+  .kw-heading { font-size:15px; font-weight:600; color:#7fdb9e;
+    margin:0 0 10px; padding-bottom:6px; border-bottom:1px solid #2a2e35; }
+  .kw-list { list-style:none; padding:0; margin:0; }
+  .kw-item { padding:7px 4px; border-bottom:1px solid #1e2228;
+    font-size:14px; display:flex; flex-wrap:wrap; gap:6px; align-items:baseline; }
+  .kw-item a { color:#7cc4ff; text-decoration:none; flex:1 1 60%; }
+  .kw-item a:hover { text-decoration:underline; }
+  .kw-date { color:#7c828c; font-size:12px; white-space:nowrap; }
+  .kw-sub { background:#1e2a3a; color:#85c8f0; padding:1px 7px;
+    border-radius:8px; font-size:11px; }
+  .kw-triggers { color:#6a7280; font-size:11px; font-style:italic; }
+
   a {{ color:#7cc4ff; }}
 </style></head><body><div class="wrap">
 <header>
